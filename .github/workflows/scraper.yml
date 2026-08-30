@@ -1,0 +1,27 @@
+name: Update IPO & GMP Data
+
+on:
+  schedule:
+    - cron: '0 */3 * * *' # Runs automatically every 3 hours
+  workflow_dispatch:        # Allows manual run from GitHub UI
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install requests beautifulsoup4 psycopg2-binary
+
+      - name: Run Scraper Script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/scrape_ipos.py
