@@ -1,89 +1,162 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-def scrape_and_update():
-    if not DATABASE_URL:
-        print("DATABASE_URL is not set!")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def clean_text(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+def extract_numbers(text):
+    match = re.search(r"(\d+)", text.replace(",", ""))
+    return int(match.group(1)) if match else 1
+
+def fetch_live_ipos():
+    url = "https://www.investorgain.com/report/live-ipo-gmp/331/"
+    print(f"Connecting to live feed: {url}")
+    
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Failed to fetch live page: {e}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    table = soup.find("table")
+    if not table:
+        print("Table not found on target page.")
+        return []
+
+    rows = table.find_all("tr")
+    scraped_data = []
+
+    # Parse table rows skipping header
+    for row in rows[1:]:
+        cols = row.find_all(["td", "th"])
+        if len(cols) < 7:
+            continue
+
+        raw_name = clean_text(cols[0].text)
+        if not raw_name or "GMP" in raw_name and len(raw_name) < 4:
+            continue
+
+        # Clean name and determine category
+        category = "SME" if "SME" in raw_name.upper() else "Mainline"
+        clean_name = re.sub(r"(?i)\s+sme\b|\s+ipo\b", "", raw_name).strip() + " IPO"
+
+        price_text = clean_text(cols[1].text)
+        gmp_val_text = clean_text(cols[2].text)
+        est_listing = clean_text(cols[3].text)
+        lot_text = clean_text(cols[5].text) if len(cols) > 5 else "1"
+        dates_text = clean_text(cols[6].text) if len(cols) > 6 else ""
+
+        # Parse lot size
+        lot_size = extract_numbers(lot_text)
+
+        # Parse open/close dates if available
+        open_date = "TBA"
+        close_date = "TBA"
+        if "-" in dates_text:
+            parts = dates_text.split("-")
+            open_date = parts[0].strip()
+            close_date = parts[1].strip()
+
+        # Format GMP
+        gmp_range = f"₹{gmp_val_text}" if gmp_val_text and gmp_val_text != "--" else "₹0"
+        percent_match = re.search(r"\((.*?)\)", est_listing)
+        gmp_percent = percent_match.group(1) if percent_match else "+0.00%"
+
+        # Estimate sentiment based on GMP %
+        rating = 5
+        sentiment = "Neutral"
+        try:
+            num_pct = float(re.sub(r"[^\d.-]", "", gmp_percent))
+            if num_pct >= 25:
+                rating = 8
+                sentiment = "Apply"
+            elif num_pct >= 10:
+                rating = 6
+                sentiment = "May Apply"
+            elif num_pct < 0:
+                rating = 3
+                sentiment = "Avoid"
+        except Exception:
+            pass
+
+        scraped_data.append({
+            "company_name": clean_name,
+            "category": category,
+            "open_date": open_date,
+            "close_date": close_date,
+            "offer_price_range": price_text if price_text else "TBA",
+            "lot_size": lot_size,
+            "gmp_range": gmp_range,
+            "gmp_percent": gmp_percent,
+            "rating_stars": rating,
+            "sentiment": sentiment,
+            "description": f"{clean_name} is actively tracked for subscription and grey market premium updates.",
+            "allotment_date": "Follow official registrar",
+            "refund_date": "Next business day",
+            "listing_date": "NSE/BSE Listed",
+            "status": "Current" if close_date != "TBA" else "Upcoming"
+        })
+
+    print(f"Scraped {len(scraped_data)} live IPOs.")
+    return scraped_data
+
+def sync_to_neon(ipos):
+    if not ipos:
+        print("No IPO data to insert.")
         return
 
-    # Sample live feed payload / dynamic structure
-    # Can be targeted to live RSS feeds or financial table aggregators
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing.")
+
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Create table with unique constraint on company_name to prevent duplicate entries
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ipos (
-            id SERIAL PRIMARY KEY,
-            company_name VARCHAR(255) UNIQUE NOT NULL,
-            logo_url TEXT,
-            open_date VARCHAR(50),
-            close_date VARCHAR(50),
-            offer_price_range VARCHAR(50),
-            lot_size INT,
-            rating_stars INT DEFAULT 7,
-            sentiment VARCHAR(50) DEFAULT 'Apply',
-            gmp_range VARCHAR(50),
-            gmp_percent VARCHAR(20),
-            description TEXT,
-            allotment_date VARCHAR(50),
-            refund_date VARCHAR(50),
-            listing_date VARCHAR(50),
-            category VARCHAR(20) DEFAULT 'Mainline',
-            status VARCHAR(20) DEFAULT 'Current',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-
-    # Upsert query: updates GMP and dates if the company already exists
     upsert_sql = """
         INSERT INTO ipos (
-            company_name, logo_url, open_date, close_date, offer_price_range,
+            company_name, open_date, close_date, offer_price_range,
             lot_size, rating_stars, sentiment, gmp_range, gmp_percent,
             description, allotment_date, refund_date, listing_date, category, status
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (
+            %(company_name)s, %(open_date)s, %(close_date)s, %(offer_price_range)s,
+            %(lot_size)s, %(rating_stars)s, %(sentiment)s, %(gmp_range)s, %(gmp_percent)s,
+            %(description)s, %(allotment_date)s, %(refund_date)s, %(listing_date)s, %(category)s, %(status)s
+        )
         ON CONFLICT (company_name) DO UPDATE SET
             gmp_range = EXCLUDED.gmp_range,
             gmp_percent = EXCLUDED.gmp_percent,
-            status = EXCLUDED.status,
+            offer_price_range = EXCLUDED.offer_price_range,
             rating_stars = EXCLUDED.rating_stars,
-            sentiment = EXCLUDED.sentiment;
+            sentiment = EXCLUDED.sentiment,
+            status = EXCLUDED.status,
+            close_date = EXCLUDED.close_date;
     """
 
-    sample_scraped_items = [
-        (
-            'Augmont Enterprises IPO', '', '21 Aug 2026', '25 Aug 2026', '750-788',
-            19, 7, 'Apply', 'Rs 284-286 Per Share', '+36.29%',
-            'Augmont Enterprises Limited is engaged in the business of precious metals, primarily focusing on gold and silver.',
-            '27 August 2026', '28 August 2026', '31 August 2026', 'Mainline', 'Current'
-        ),
-        (
-            'Skyways Air IPO', '', '24 Aug 2026', '27 Aug 2026', '131-138',
-            100, 5, 'Neutral', 'Rs 38-39 Per Share', '+28.26%',
-            'Skyways Air Services Limited (SASL) is a leading air freight forwarding and logistics company in India.',
-            '28 August 2026', '31 August 2026', '01 September 2026', 'Mainline', 'Current'
-        ),
-        (
-            'Symbiotec Pharmalab IPO', '', '24 Aug 2026', '27 Aug 2026', '938-988',
-            15, 8, 'Apply', 'Rs 238-240 Per Share', '+24.29%',
-            'Symbiotec Pharmalab Ltd. is a pharmaceutical and biotechnology company.',
-            '28 August 2026', '31 August 2026', '01 September 2026', 'Mainline', 'Current'
-        )
-    ]
-
-    for item in sample_scraped_items:
-        cur.execute(upsert_sql, item)
+    for ipo in ipos:
+        cur.execute(upsert_sql, ipo)
 
     conn.commit()
     cur.close()
     conn.close()
-    print("Database synchronized successfully.")
+    print("Neon PostgreSQL successfully updated with live data.")
 
 if __name__ == "__main__":
-    scrape_and_update()
+    live_records = fetch_live_ipos()
+    sync_to_neon(live_records)

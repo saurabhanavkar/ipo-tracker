@@ -2,8 +2,9 @@ name: Update IPO & GMP Data
 
 on:
   schedule:
-    - cron: '0 */3 * * *' # Runs automatically every 3 hours
-  workflow_dispatch:        # Allows manual run from GitHub UI
+    - cron: '*/30 3-12 * * 1-5' # Runs every 30 minutes during IST trading hours (Mon-Fri)
+    - cron: '0 0,14 * * *'        # Runs once at start/end of day
+  workflow_dispatch:
 
 jobs:
   scrape-and-update:
@@ -18,8 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: |
-          pip install requests beautifulsoup4 psycopg2-binary
+        run: pip install requests beautifulsoup4 psycopg2-binary
 
       - name: Run Scraper Script
         env:
